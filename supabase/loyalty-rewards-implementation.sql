@@ -606,11 +606,6 @@ begin
     ) then
       raise exception 'Select the platform-owned UGX Books organization before activating rewards';
     end if;
-    insert into public.books_accounts (organization_id, code, name, type, is_system)
-    values
-      (new.books_organization_id, new.books_expense_account_code, 'Loyalty rewards expense', 'expense', true),
-      (new.books_organization_id, new.books_liability_account_code, 'Loyalty points liability', 'liability', true)
-    on conflict (organization_id, code) do nothing;
     if not exists (
       select 1 from public.books_accounts where organization_id = new.books_organization_id
         and code = new.books_expense_account_code and type = 'expense'
@@ -1123,6 +1118,10 @@ drop trigger if exists retry_loyalty_awards_after_fx_update on public.books_fx_r
 update public.loyalty_program_settings set program_enabled=false, redemption_enabled=false where id=true;
 revoke execute on function public.process_pending_loyalty_awards() from service_role;
 revoke execute on function public.retry_failed_loyalty_award(uuid) from service_role;
+revoke execute on function public.retry_loyalty_books_posting(uuid) from service_role;
+revoke execute on function public.process_pending_loyalty_awards() from public,anon,authenticated;
+revoke execute on function public.retry_failed_loyalty_award(uuid) from public,anon,authenticated;
+revoke execute on function public.retry_loyalty_books_posting(uuid) from public,anon,authenticated;
 revoke all on function public.set_my_loyalty_enrollment(boolean) from public,anon,authenticated;
 
 create table if not exists public.hotel_loyalty_programs (
@@ -1134,15 +1133,19 @@ create table if not exists public.hotel_loyalty_programs (
   task_approval_points integer not null default 50 check (task_approval_points > 0),
   monthly_task_points_cap integer not null default 500 check (monthly_task_points_cap > 0),
   ugx_value_per_point numeric(20,4) not null default 10 check (ugx_value_per_point > 0),
-  books_expense_account_code text not null default '5105',
-  books_liability_account_code text not null default '2600',
+  books_expense_account_code text,
+  books_liability_account_code text,
   books_redemption_account_code text,
   program_enabled boolean not null default false,
   redemption_enabled boolean not null default false,
   points_expire boolean not null default false,
   updated_at timestamptz not null default now(),
-  check (books_expense_account_code <> books_liability_account_code)
+  check (books_expense_account_code is null or books_liability_account_code is null or books_expense_account_code <> books_liability_account_code)
 );
+alter table public.hotel_loyalty_programs alter column books_expense_account_code drop not null;
+alter table public.hotel_loyalty_programs alter column books_expense_account_code drop default;
+alter table public.hotel_loyalty_programs alter column books_liability_account_code drop not null;
+alter table public.hotel_loyalty_programs alter column books_liability_account_code drop default;
 alter table public.hotel_loyalty_programs add column if not exists books_redemption_account_code text;
 
 alter table public.menu_items add column if not exists organization_id uuid references public.books_organizations(id) on delete restrict;
@@ -1167,15 +1170,24 @@ alter table public.menu_orders add constraint menu_orders_secure_total_check che
 ) not valid;
 
 alter table public.hotel_bookings add column if not exists gross_total_amount numeric(20,4);
+alter table public.hotel_bookings add column if not exists amount_due numeric(20,4);
 alter table public.hotel_bookings add column if not exists loyalty_points_discount numeric(20,4) not null default 0;
 alter table public.hotel_bookings add column if not exists loyalty_points_redeemed bigint not null default 0;
-update public.hotel_bookings set gross_total_amount=total_amount where gross_total_amount is null;
+update public.hotel_bookings set gross_total_amount=coalesce(gross_total_amount,total_amount),amount_due=coalesce(amount_due,total_amount)
+where gross_total_amount is null or amount_due is null;
 alter table public.hotel_bookings alter column gross_total_amount set not null;
+alter table public.hotel_bookings alter column amount_due set default 0;
+alter table public.hotel_bookings alter column amount_due set not null;
 alter table public.hotel_bookings drop constraint if exists hotel_bookings_secure_total_check;
 alter table public.hotel_bookings add constraint hotel_bookings_secure_total_check check (
-  public.checkout_currency_minor_units(currency_code) is not null and nightly_subtotal >= 0
-  and discount_amount >= 0 and taxable_subtotal >= 0 and vat_amount >= 0 and lht_amount >= 0
-  and loyalty_points_discount >= 0
+  public.checkout_currency_minor_units(currency_code) is not null
+  and nightly_subtotal::text not in ('NaN','Infinity','-Infinity') and discount_amount::text not in ('NaN','Infinity','-Infinity')
+  and taxable_subtotal::text not in ('NaN','Infinity','-Infinity') and vat_amount::text not in ('NaN','Infinity','-Infinity')
+  and lht_amount::text not in ('NaN','Infinity','-Infinity') and total_amount::text not in ('NaN','Infinity','-Infinity')
+  and gross_total_amount::text not in ('NaN','Infinity','-Infinity') and amount_due::text not in ('NaN','Infinity','-Infinity')
+  and loyalty_points_discount::text not in ('NaN','Infinity','-Infinity')
+  and nightly_subtotal >= 0 and discount_amount >= 0 and taxable_subtotal >= 0 and vat_amount >= 0 and lht_amount >= 0
+  and loyalty_points_discount >= 0 and loyalty_points_discount <= total_amount and amount_due >= 0
   and gross_total_amount = round(taxable_subtotal + vat_amount + lht_amount,public.checkout_currency_minor_units(currency_code))
   and total_amount = gross_total_amount
   and amount_due = round(total_amount-loyalty_points_discount,public.checkout_currency_minor_units(currency_code))
@@ -1184,14 +1196,23 @@ alter table public.hotel_bookings add constraint hotel_bookings_secure_total_che
 alter table public.special_events add column if not exists organization_id uuid references public.books_organizations(id) on delete restrict;
 alter table public.special_event_bookings add column if not exists organization_id uuid references public.books_organizations(id) on delete restrict;
 alter table public.special_event_bookings add column if not exists gross_total_amount numeric(20,4);
+alter table public.special_event_bookings add column if not exists amount_due numeric(20,4);
 alter table public.special_event_bookings add column if not exists loyalty_points_discount numeric(20,4) not null default 0;
 alter table public.special_event_bookings add column if not exists loyalty_points_redeemed bigint not null default 0;
-update public.special_event_bookings set gross_total_amount=total_amount where gross_total_amount is null;
+update public.special_event_bookings set gross_total_amount=coalesce(gross_total_amount,total_amount),amount_due=coalesce(amount_due,total_amount)
+where gross_total_amount is null or amount_due is null;
 alter table public.special_event_bookings alter column gross_total_amount set not null;
+alter table public.special_event_bookings alter column amount_due set default 0;
+alter table public.special_event_bookings alter column amount_due set not null;
 alter table public.special_event_bookings drop constraint if exists special_event_bookings_secure_total_check;
 alter table public.special_event_bookings add constraint special_event_bookings_secure_total_check check (
-  public.checkout_currency_minor_units(currency) is not null and subtotal >= 0 and service_fee >= 0
-  and tax_amount >= 0 and discount_amount >= 0 and loyalty_points_discount >= 0
+  public.checkout_currency_minor_units(currency) is not null
+  and subtotal::text not in ('NaN','Infinity','-Infinity') and service_fee::text not in ('NaN','Infinity','-Infinity')
+  and tax_amount::text not in ('NaN','Infinity','-Infinity') and discount_amount::text not in ('NaN','Infinity','-Infinity')
+  and total_amount::text not in ('NaN','Infinity','-Infinity') and gross_total_amount::text not in ('NaN','Infinity','-Infinity')
+  and amount_due::text not in ('NaN','Infinity','-Infinity') and loyalty_points_discount::text not in ('NaN','Infinity','-Infinity')
+  and subtotal >= 0 and service_fee >= 0 and tax_amount >= 0 and discount_amount >= 0
+  and loyalty_points_discount >= 0 and loyalty_points_discount <= total_amount and amount_due >= 0
   and gross_total_amount = round(subtotal + service_fee + tax_amount - discount_amount,public.checkout_currency_minor_units(currency))
   and total_amount = gross_total_amount
   and amount_due = round(total_amount-loyalty_points_discount,public.checkout_currency_minor_units(currency))
@@ -1211,13 +1232,13 @@ alter table public.hotel_bookings add constraint hotel_bookings_payment_method_c
 
 -- Backfill only records with one unambiguous Books organization.
 with unique_org as (
-  select user_id,min(organization_id) organization_id from public.books_memberships
+  select user_id,(array_agg(organization_id order by organization_id))[1] organization_id from public.books_memberships
   group by user_id having count(distinct organization_id)=1
 )
 update public.menu_items i set organization_id=u.organization_id from unique_org u
 where i.organization_id is null and i.managed_by=u.user_id;
 with unique_org as (
-  select user_id,min(organization_id) organization_id from public.books_memberships
+  select user_id,(array_agg(organization_id order by organization_id))[1] organization_id from public.books_memberships
   group by user_id having count(distinct organization_id)=1
 )
 update public.special_events e set organization_id=u.organization_id from unique_org u
@@ -1225,15 +1246,15 @@ where e.organization_id is null and e.organizer_id=u.user_id;
 update public.special_event_bookings b set organization_id=e.organization_id from public.special_events e
 where b.event_id=e.id and b.organization_id is null;
 with unique_org as (
-  select user_id,min(organization_id) organization_id from public.books_memberships
+  select user_id,(array_agg(organization_id order by organization_id))[1] organization_id from public.books_memberships
   group by user_id having count(distinct organization_id)=1
 )
 update public.tasks t set organization_id=u.organization_id from unique_org u
 where t.organization_id is null and t.created_by=u.user_id;
 update public.menu_orders o set organization_id=x.organization_id from (
-  select moi.order_id,min(i.organization_id) organization_id from public.menu_order_items moi
+  select moi.order_id,(array_agg(i.organization_id order by i.organization_id))[1] organization_id from public.menu_order_items moi
   join public.menu_items i on i.id=moi.menu_item_id group by moi.order_id
-  having count(distinct i.organization_id)=1 and min(i.organization_id) is not null
+  having count(distinct i.organization_id)=1 and count(i.organization_id)>0
 ) x where o.id=x.order_id and o.organization_id is null;
 
 create table if not exists public.hotel_loyalty_accounts (
@@ -1454,8 +1475,12 @@ create or replace function public.attach_special_event_hotel()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 declare selected_org uuid;
 begin
+  if tg_op='UPDATE' and old.organization_id is not null then
+    if new.organization_id is distinct from old.organization_id then raise exception 'An event cannot be moved to another hotel organization'; end if;
+    new.organization_id:=old.organization_id;
+  end if;
   if new.organization_id is null then
-    select min(m.organization_id) into selected_org from public.books_memberships m where m.user_id=new.organizer_id
+    select (array_agg(m.organization_id order by m.organization_id))[1] into selected_org from public.books_memberships m where m.user_id=new.organizer_id
     group by m.user_id having count(distinct m.organization_id)=1;
     new.organization_id:=selected_org;
   end if;
@@ -1464,6 +1489,10 @@ begin
     where m.organization_id=new.organization_id and m.user_id=new.organizer_id
   ) then
     raise exception 'Choose a hotel organization that the event organizer belongs to';
+  end if;
+  if auth.role()<>'service_role' and not exists(select 1 from public.books_memberships m
+    where m.organization_id=new.organization_id and m.user_id=auth.uid()) then
+    raise exception 'The event editor must belong to the selected hotel';
   end if;
   insert into public.hotel_loyalty_programs(organization_id) values(new.organization_id) on conflict do nothing;
   return new;
@@ -1489,14 +1518,25 @@ create or replace function public.configure_task_hotel_rewards()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 declare selected_org uuid;
 begin
+  if tg_op='INSERT' and auth.role()<>'service_role' and new.created_by is distinct from auth.uid() then
+    raise exception 'Task creator must be the authenticated manager';
+  end if;
+  if tg_op='UPDATE' and auth.role()<>'service_role' and (new.created_by is distinct from old.created_by or new.organization_id is distinct from old.organization_id) then
+    raise exception 'Task creator and hotel organization cannot be changed';
+  end if;
+  if tg_op='UPDATE' and old.organization_id is not null then new.organization_id:=old.organization_id; end if;
   if new.organization_id is null then
-    select min(m.organization_id) into selected_org from public.books_memberships m where m.user_id=new.created_by
+    select (array_agg(m.organization_id order by m.organization_id))[1] into selected_org from public.books_memberships m where m.user_id=new.created_by
     group by m.user_id having count(distinct m.organization_id)=1;
     new.organization_id:=selected_org;
   end if;
   if new.organization_id is null then raise exception 'Select the hotel organization for this task'; end if;
   if not exists(select 1 from public.books_memberships m where m.organization_id=new.organization_id and m.user_id=new.created_by and m.role in ('owner','admin')) then
     raise exception 'Task manager must belong to the selected hotel';
+  end if;
+  if auth.role()<>'service_role' and not exists(select 1 from public.books_memberships m
+    where m.organization_id=new.organization_id and m.user_id=auth.uid() and m.role in ('owner','admin')) then
+    raise exception 'Only a hotel owner or admin may assign task organization';
   end if;
   insert into public.hotel_loyalty_programs(organization_id) values(new.organization_id) on conflict do nothing;
   return new;
@@ -1513,7 +1553,7 @@ begin
   loop
     code_value:='HT-'||upper(substr(replace(gen_random_uuid()::text,'-',''),1,12));
     insert into public.hotel_loyalty_accounts(organization_id,user_id,referral_code) values(target_organization_id,target_user_id,code_value)
-      on conflict(organization_id,referral_code) do nothing;
+      on conflict do nothing;
     if found then return code_value; end if;
     select referral_code into code_value from public.hotel_loyalty_accounts where organization_id=target_organization_id and user_id=target_user_id;
     if code_value is not null then return code_value; end if;
@@ -1638,7 +1678,7 @@ begin
   select coalesce(jsonb_agg(jsonb_build_object(
     'organizationId',p.organization_id,'hotelName',o.name,'enrolled',coalesce(a.is_enrolled,false),'referralCode',a.referral_code,
     'availablePoints',greatest(coalesce(a.available_points,0)-coalesce((select sum(r.points_redeemed) from public.hotel_loyalty_redemptions r
-      where r.organization_id=p.organization_id and r.user_id=auth.uid() and r.status='reserved'),0),0),
+      where r.organization_id=p.organization_id and r.user_id=auth.uid() and r.status='reserved' and r.expires_at>now()),0),0),
     'lifetimePoints',coalesce(a.lifetime_points_earned,0),'debtPoints',coalesce(a.debt_points,0),
     'referrals',jsonb_build_object(
       'total',(select count(*) from public.hotel_loyalty_referrals r where r.organization_id=p.organization_id and r.referrer_user_id=auth.uid()),
@@ -2209,7 +2249,7 @@ grant execute on function public.reserve_hotel_loyalty_redemption(uuid,text,uuid
 
 create or replace function public.complete_full_points_checkout(target_source_type text,target_source_id uuid)
 returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
-declare uid uuid:=auth.uid(); org uuid; due numeric; b public.hotel_bookings%rowtype; room public.hotel_rooms%rowtype;
+declare uid uuid:=auth.uid(); org uuid; due numeric; redemption_program_enabled boolean; b public.hotel_bookings%rowtype; room public.hotel_rooms%rowtype;
   eb public.special_event_bookings%rowtype; event_row public.special_events%rowtype; reserved integer; rem bigint; type_rem bigint;
   r public.hotel_loyalty_redemptions%rowtype; confirmation text; ticket text;
 begin
@@ -2219,6 +2259,8 @@ begin
   elsif target_source_type='special_event_booking' then select * into eb from public.special_event_bookings where id=target_source_id and user_id=uid for update; org:=eb.organization_id; due:=eb.amount_due;
   else raise exception 'Unsupported hotel checkout'; end if;
   if org is null or due<>0 then raise exception 'Points do not cover the amount due'; end if;
+  select program_enabled and redemption_enabled into redemption_program_enabled from public.hotel_loyalty_programs where organization_id=org;
+  if not coalesce(redemption_program_enabled,false) then raise exception 'Hotel checkout redemption is disabled'; end if;
   select * into r from public.hotel_loyalty_redemptions where organization_id=org and source_type=target_source_type and source_id=target_source_id and user_id=uid and status='reserved' and expires_at>now() for update;
   if not found then raise exception 'Matching hotel points reservation was not found'; end if;
   if target_source_type='menu_order' then
@@ -2260,8 +2302,15 @@ create or replace function public.assign_menu_item_hotel()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
 declare selected_org uuid;
 begin
+  if tg_op='INSERT' and auth.role()<>'service_role' and new.managed_by is distinct from auth.uid() then
+    raise exception 'Menu item manager must be the authenticated user';
+  end if;
+  if tg_op='UPDATE' and auth.role()<>'service_role' and (new.managed_by is distinct from old.managed_by or new.organization_id is distinct from old.organization_id) then
+    raise exception 'Menu item ownership and hotel organization cannot be changed';
+  end if;
+  if tg_op='UPDATE' and old.organization_id is not null then new.organization_id:=old.organization_id; end if;
   if new.organization_id is null then
-    select min(organization_id) into selected_org from public.books_memberships where user_id=new.managed_by
+    select (array_agg(organization_id order by organization_id))[1] into selected_org from public.books_memberships where user_id=new.managed_by
     group by user_id having count(distinct organization_id)=1;
     new.organization_id:=selected_org;
   end if;
@@ -2374,8 +2423,13 @@ begin
   if contact_id is null then insert into public.books_contacts(organization_id,name,type,email,phone) values(org,coalesce(contact_name,contact_email),'customer',contact_email,contact_phone) returning id into contact_id; end if;
   if new.tax_amount>0 and new.subtotal>0 then
     tax_rate:=round(new.tax_amount/new.subtotal*100,4);
-    insert into public.books_tax_rates(organization_id,country_code,name,rate_percentage) values(org,'UG','Menu sale tax '||tax_rate||'%',tax_rate) on conflict(organization_id,name,effective_from) do nothing;
-    select id into tax_id from public.books_tax_rates where organization_id=org and rate_percentage=tax_rate and is_active and order_day>=effective_from and (effective_to is null or order_day<=effective_to) order by created_at desc limit 1;
+    perform pg_advisory_xact_lock(hashtextextended(org::text||':menu-tax:'||tax_rate::text,0));
+    select id into tax_id from public.books_tax_rates where organization_id=org and rate_percentage=tax_rate and is_active
+      and order_day>=effective_from and (effective_to is null or order_day<=effective_to) order by created_at desc limit 1;
+    if tax_id is null then
+      insert into public.books_tax_rates(organization_id,country_code,name,rate_percentage)
+      values(org,'UG','Menu sale tax '||tax_rate||'%',tax_rate) returning id into tax_id;
+    end if;
   end if;
   select id into created_invoice_id from public.books_invoices where organization_id=org and invoice_number='MENU-'||new.order_number;
   if created_invoice_id is null then
@@ -2397,7 +2451,8 @@ drop trigger if exists menu_order_paid_books_v2 on public.menu_orders;
 create trigger menu_order_paid_books_v2 after insert or update of payment_status on public.menu_orders for each row execute function public.post_paid_menu_order_to_books_v2();
 revoke all on function public.post_paid_menu_order_to_books_v2() from public;
 
--- Hotel and event payment attempts continue to use total_amount. Redemption updates that field
--- to the net amount due while gross_total_amount remains the immutable checkout gross.
+-- Redemption is fail-closed: current hotel, event, and menu payment verification and Books
+-- settlement paths still use gross totals. Do not remove the configuration guard until those paths
+-- reserve points, collect amount_due, and settle the hotel-specific redemption clearing entry.
 
 commit;

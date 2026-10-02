@@ -179,6 +179,7 @@ const RegisterPage: React.FC = () => {
             service_category: formData.serviceCategory || null,
             menu_access_role: formData.menuAccessRole || null,
             referral_code: formData.referralCode.trim().toUpperCase() || null,
+            loyalty_organization_id: new URLSearchParams(window.location.search).get("loyaltyOrganization"),
             loyalty_program: formData.loyaltyProgram,
           },
         },

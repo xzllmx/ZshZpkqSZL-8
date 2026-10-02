@@ -84,11 +84,6 @@ const Header = () => {
           return;
         }
 
-        const { data: rewardsSummary, error: rewardsError } = await supabase.rpc("get_my_loyalty_summary");
-        if (!rewardsError && isMounted) {
-          setLoyaltyPoints(Number((rewardsSummary as { availablePoints?: number } | null)?.availablePoints ?? 0));
-        }
-
         const { data: profile } = await supabase
           .from("user_profiles")
           .select("role, first_name, last_name, menu_access_role, menu_access_approved")
