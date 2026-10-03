@@ -67,6 +67,8 @@ import {
 import { format, addDays } from "date-fns";
 
 type RewardsSummary = {
+  organizationId: string;
+  hotelName: string;
   availablePoints: number;
   lifetimePoints: number;
   enrolled: boolean;
@@ -96,7 +98,9 @@ const ServicesProfilePage = () => {
   const [showPerformanceDetails, setShowPerformanceDetails] = useState(false);
   const [dataLoaded, setDataLoaded] = useState(false);
   const [userRole, setUserRole] = useState<'guest' | 'manager' | 'service_provider' | null>(null);
-  const [rewardsSummary, setRewardsSummary] = useState<RewardsSummary | null>(null);
+  const [rewardsPrograms, setRewardsPrograms] = useState<RewardsSummary[]>([]);
+  const [selectedRewardsOrganization, setSelectedRewardsOrganization] = useState("");
+  const rewardsSummary = rewardsPrograms.find((program) => program.organizationId === selectedRewardsOrganization) ?? rewardsPrograms[0] ?? null;
   const [rewardsLoadError, setRewardsLoadError] = useState(false);
   const saveTimeoutsRef = useRef<Record<string, NodeJS.Timeout>>({});
   const userIdRef = useRef<string | null>(null);
@@ -230,7 +234,9 @@ const ServicesProfilePage = () => {
           console.error("Unable to load rewards summary:", rewardsError);
           setRewardsLoadError(true);
         } else {
-          setRewardsSummary(rewards as RewardsSummary);
+          const programs = (rewards as { programs?: RewardsSummary[] } | null)?.programs ?? [];
+          setRewardsPrograms(programs);
+          setSelectedRewardsOrganization((current) => current || programs[0]?.organizationId || "");
           setRewardsLoadError(false);
         }
         setDataLoaded(true);
@@ -338,7 +344,7 @@ const ServicesProfilePage = () => {
 
   const shareReferralLink = async () => {
     if (!rewardsSummary?.referralCode) return;
-    const url = `${window.location.origin}/register?ref=${encodeURIComponent(rewardsSummary.referralCode)}`;
+    const url = `${window.location.origin}/register?ref=${encodeURIComponent(rewardsSummary.referralCode)}&loyaltyOrganization=${encodeURIComponent(rewardsSummary.organizationId)}`;
     if (navigator.share) {
       await navigator.share({ title: "Join me", text: "Use my referral code when you sign up.", url });
       return;
@@ -348,12 +354,16 @@ const ServicesProfilePage = () => {
   };
 
   const updateRewardsEnrollment = async (enrolled: boolean) => {
-    const { error } = await supabase.rpc("set_my_loyalty_enrollment", { target_enrolled: enrolled });
+    if (!rewardsSummary) return;
+    const { error } = await supabase.rpc("set_my_loyalty_enrollment", {
+      target_organization_id: rewardsSummary.organizationId,
+      target_enrolled: enrolled,
+    });
     if (error) {
       toast({ title: "Rewards preference could not be saved", description: error.message, variant: "destructive" });
       return;
     }
-    setRewardsSummary((current) => current ? { ...current, enrolled } : current);
+    setRewardsPrograms((current) => current.map((program) => program.organizationId === rewardsSummary.organizationId ? { ...program, enrolled } : program));
     toast({ title: enrolled ? "Rewards enrollment enabled" : "Rewards enrollment paused" });
   };
 
@@ -1439,7 +1449,7 @@ const ServicesProfilePage = () => {
 
           {/* Billing Tab */}
           <TabsContent value="billing" className="space-y-6">
-            <BillingTab userRole={userRole} userData={userData} />
+            <BillingTab userRole={userRole === "guest" ? null : userRole} userData={userData} />
           </TabsContent>
 
           {/* Preferences Tab */}
@@ -1650,19 +1660,33 @@ const ServicesProfilePage = () => {
             {rewardsSummary && !rewardsSummary.policy.programEnabled && (
               <Card className="border-amber-300 bg-amber-50">
                 <CardContent className="pt-6 text-sm text-amber-900">
-                  Rewards are waiting for the platform Books organization to be configured and the program to be activated. Verified awards remain queued; points are not redeemable yet.
+                  {rewardsSummary.hotelName} rewards are waiting for this hotel’s Finance-approved Books mappings and activation. No points can be earned or redeemed while the program is disabled.
                 </CardContent>
               </Card>
+            )}
+            {rewardsPrograms.length > 1 && (
+              <div className="max-w-md space-y-2">
+                <Label htmlFor="rewards-hotel">Hotel rewards account</Label>
+                <Select value={rewardsSummary?.organizationId ?? ""} onValueChange={setSelectedRewardsOrganization}>
+                  <SelectTrigger id="rewards-hotel"><SelectValue placeholder="Choose a hotel" /></SelectTrigger>
+                  <SelectContent>
+                    {rewardsPrograms.map((program) => <SelectItem key={program.organizationId} value={program.organizationId}>{program.hotelName}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            {!rewardsLoadError && !rewardsPrograms.length && (
+              <Card><CardContent className="pt-6 text-sm text-muted-foreground">No hotel rewards account is available yet. Each hotel has a separate balance and enrollment.</CardContent></Card>
             )}
             <Card>
               <CardContent className="flex flex-col gap-4 pt-6 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h3 className="font-semibold text-sheraton-navy">Rewards enrollment</h3>
-                  <p className="text-sm text-muted-foreground">{rewardsSummary?.enrolled ? "Eligible purchases and approved activity can earn points." : "Enrollment is paused. Your existing points and history are preserved."}</p>
+                  <p className="text-sm text-muted-foreground">{rewardsSummary?.enrolled ? `Eligible purchases and approved activity at ${rewardsSummary.hotelName} can earn points.` : "Enrollment is paused for this hotel. Other hotel balances are separate."}</p>
                 </div>
                 <div className="flex items-center gap-3">
                   <Label htmlFor="rewards-enrollment">{rewardsSummary?.enrolled ? "Enrolled" : "Not enrolled"}</Label>
-                  <Switch id="rewards-enrollment" checked={rewardsSummary?.enrolled ?? false} disabled={!rewardsSummary} onCheckedChange={updateRewardsEnrollment} />
+                  <Switch id="rewards-enrollment" checked={rewardsSummary?.enrolled ?? false} disabled={!rewardsSummary?.policy.programEnabled} onCheckedChange={updateRewardsEnrollment} />
                 </div>
               </CardContent>
             </Card>

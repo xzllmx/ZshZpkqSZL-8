@@ -115,10 +115,14 @@ const ProviderReportForm: React.FC<ProviderReportFormProps> = ({
           .eq("id", taskReport.id);
 
         if (error) throw error;
+        if (percentage >= 100) {
+          const { error: approvalError } = await supabase.rpc("submit_task_report_for_approval", { target_report_id: taskReport.id });
+          if (approvalError) throw approvalError;
+        }
 
         toast({
           title: "Success",
-          description: "Progress report updated",
+          description: percentage >= 100 ? "Report submitted for manager approval" : "Progress report updated",
         });
       } else {
         // Create new report if it doesn't exist (fallback if trigger didn't fire)
@@ -135,7 +139,6 @@ const ProviderReportForm: React.FC<ProviderReportFormProps> = ({
           .single();
 
         if (error) {
-          // If still fails, provide helpful error message
           if (error.message.includes("foreign key") || error.message.includes("23503")) {
             throw new Error(
               "Unable to create report. Please ensure your user profile is properly linked. Try refreshing the page."
@@ -143,10 +146,14 @@ const ProviderReportForm: React.FC<ProviderReportFormProps> = ({
           }
           throw error;
         }
+        if (percentage >= 100 && data?.id) {
+          const { error: approvalError } = await supabase.rpc("submit_task_report_for_approval", { target_report_id: data.id });
+          if (approvalError) throw approvalError;
+        }
 
         toast({
           title: "Success",
-          description: "Progress report created",
+          description: percentage >= 100 ? "Report submitted for manager approval" : "Progress report created",
         });
       }
 
